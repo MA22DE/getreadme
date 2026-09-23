@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# getreadme — download only README.md from GitHub repositories.
+# No cloning. Requires the GitHub CLI (gh).
+
+set -u
+
+PROG="getreadme"
+
+usage() {
+    cat <<EOF
+$PROG <github-url> [github-url ...]
+
+Download only the README.md of each GitHub repository into
+./<repo-name>/README.md — without cloning the repository.
+
+Requires the GitHub CLI (gh): https://cli.github.com
+
+Examples:
+  $PROG https://github.com/vercel/next.js
+  $PROG https://github.com/vercel/next.js https://github.com/facebook/react
+
+Options:
+  -h, --help    Show this help and exit.
+EOF
+}
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# --- argument handling -------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+# --- dependency check --------------------------------------------------------
+
+if ! command -v gh >/dev/null 2>&1; then
+    err "the GitHub CLI (gh) is not installed and is required."
+    cat >&2 <<'EOF'
+
+Install it, then authenticate:
+
+  macOS (Homebrew):  brew install gh
+  Other platforms:   https://github.com/cli/cli#installation
+
+  gh auth login
+
+Then re-run getreadme. (gh is required so that private repositories and
+API errors are handled reliably; no unauthenticated fallback is used.)
+EOF
+    exit 1
+fi
+
+# --- main loop ---------------------------------------------------------------
+
+total=0
+failed=0
+
+for url in "$@"; do
+    printf '==> %s\n' "$url"
+    total=$((total + 1))
+
+    # Normalise SSH-style URLs so the parser below only sees one shape.
+    case "$url" in
+        git@github.com:*) url="https://github.com/${url#git@github.com:}" ;;
+    esac
+
+    # Validate host.
+    case "$url" in
+        https://github.com/*|http://github.com/*|github.com/*) ;;
+        *)
+            err "$url is not a valid GitHub repository URL"
+            failed=$((failed + 1))
+            continue
+            ;;
+    esac
+
+    path=${url#*github.com/}
+    path=${path%%\#*}
+    path=${path%%\?*}
+    while [ "${path%/}" != "$path" ]; do path=${path%/}; done
+    case "$path" in
+        *.git) path=${path%.git} ;;
+    esac
+
+    owner=${path%%/*}
+    rest=${path#*/}
+    repo=${rest%%/*}
+
+    if [ -z "$owner" ] || [ -z "$repo" ] || [ "$rest" = "$path" ]; then
+        err "$url is not a valid GitHub repository URL (expected https://github.com/OWNER/REPO)"
+        failed=$((failed + 1))
+        continue
+    fi
+
+    full="$owner/$repo"
+    dest="./$repo"
+    target="$dest/README.md"
+
+    # Respect an existing folder: never create anything but README.md.
+    created_dir=0
+    if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+        err "$full: './$repo' exists and is not a directory — skipped"
+        failed=$((failed + 1))
+        continue
+    fi
+    if [ ! -d "$dest" ]; then
+        if ! mkdir "$dest"; then
+            err "$full: could not create './$repo'"
+            failed=$((failed + 1))
+            continue
+        fi
+        created_dir=1
+    fi
+
+    if [ -f "$target" ]; then
+        printf '    note: %s already exists and will be overwritten\n' "$target"
+    fi
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/getreadme.XXXXXX") || {
+        err "$full: could not create a temporary file"
+        [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
+        failed=$((failed + 1))
+        continue
+    }
+
+    if gh api "repos/$full/readme" \
+        -H "Accept: application/vnd.github.raw" >"$work/body" 2>"$work/err"; then
+        if [ -s "$work/body" ]; then
+            if mv "$work/body" "$target"; then
+                printf '    ok: %s\n' "$target"
+            else
+                err "$full: could not write $target"
+                failed=$((failed + 1))
+            fi
+        else
+            err "$full: the README returned by GitHub is empty — skipped"
+            [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
+            failed=$((failed + 1))
+        fi
+    else
+        # Diagnose using gh's own message, so no extra guesswork is needed.
+        case "$(cat "$work/err")" in
+            *"HTTP 404"*)
+                # 404 means either a missing repository or a missing README.
+                # Ask for the repository itself to tell the two apart.
+                if gh api "repos/$full" --silent >/dev/null 2>&1; then
+                    err "$full: this repository has no README — nothing downloaded"
+                else
+                    err "$full: repository not found (404), or it is private — run: gh auth login"
+                fi
+                ;;
+            *"HTTP 401"*|*"HTTP 403"*)
+                err "$full: authentication or permission failure — run: gh auth login"
+                err "$full: check the current account with: gh auth status"
+                ;;
+            *)
+                err "$full: GitHub API request failed"
+                sed 's/^/    /' "$work/err" >&2
+                ;;
+        esac
+        [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
+        failed=$((failed + 1))
+    fi
+
+    rm -rf "$work"
+done
+
+# --- summary -----------------------------------------------------------------
+
+if [ "$total" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "$failed" -gt 0 ]; then
+    printf '%s: %d of %d repositories failed\n' "$PROG" "$failed" "$total" >&2
+    exit 1
+fi
+
+exit 0
