@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# getreadme — download only README.md from GitHub repositories.
-# No cloning. Requires the GitHub CLI (gh).
+# getreadme — download only the README of GitHub repositories and star lists
+# into one folder per repository. No cloning. Requires the GitHub CLI (gh).
 
 set -u
 
@@ -9,37 +9,396 @@ PROG="getreadme"
 
 usage() {
     cat <<EOF
-$PROG <github-url> [github-url ...]
+$PROG <url> [<url> ...]
 
-Download only the README.md of each GitHub repository into
-./<repo-name>/README.md — without cloning the repository.
+Download only the README of each GitHub source — without cloning.
+
+Sources:
+  https://github.com/OWNER/REPO              one repository
+  https://github.com/stars/USER/lists/SLUG   one GitHub star list
+  https://github.com/stars/USER              every starred repository
+
+Layout (one folder per repository):
+  repository   ./OWNER/REPO/README.md
+  star list    ./SLUG/OWNER/REPO/README.md
+  all stars    ./USER-stars/OWNER/REPO/README.md
+  -flat        ./OWNER/REPO/README.md       (no SLUG/ or USER-stars/ folder)
+
+Re-running is cheap: a README that is already on disk is only asked about by
+ETag, so a file that did not change on GitHub is not downloaded again.
+Repositories added to a list since the last run are fetched automatically,
+and a README that was changed locally is restored. A repository that was
+removed from a list is not deleted: its folder is left in place.
 
 Requires the GitHub CLI (gh): https://cli.github.com
 
+Options:
+  -flat, --flat   Skip the star list / USER-stars folder (see Layout above).
+  -list, --list   Accepted for convenience; star list URLs are recognised
+                  automatically by their shape.
+  -h, --help      Show this help and exit.
+
 Examples:
   $PROG https://github.com/vercel/next.js
-  $PROG https://github.com/vercel/next.js https://github.com/facebook/react
-
-Options:
-  -h, --help    Show this help and exit.
+  $PROG https://github.com/stars/USER/lists/SLUG
+  $PROG https://github.com/stars/USER
+  $PROG https://github.com/stars/USER/lists/SLUG -flat
 EOF
 }
 
 err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
+# --- helpers -----------------------------------------------------------------
+
+# blob_sha FILE — the Git blob hash of FILE. GitHub reports exactly this value
+# as the ETag of a README, which is what makes change detection possible
+# without keeping any state on disk.
+blob_sha() {
+    if command -v git >/dev/null 2>&1; then
+        git hash-object -- "$1" 2>/dev/null && return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        size=$(LC_ALL=C wc -c <"$1" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$size" ]; then
+            { printf 'blob %s' "$size"; printf '\0'; cat "$1"; } | shasum | cut -d' ' -f1
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# valid_name NAME — reject names that are unsafe as a directory component.
+valid_name() {
+    case "$1" in
+        ""|.|..|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# parse_source URL — fills in src_kind (repo|list|stars), src_owner, src_repo
+# and src_slug. Prints a message and returns non-zero on bad input.
+parse_source() {
+    url=$1
+
+    # Normalise SSH-style URLs so the parser below only sees one shape.
+    case "$url" in
+        git@github.com:*) url="https://github.com/${url#git@github.com:}" ;;
+    esac
+
+    case "$url" in
+        https://github.com/*|http://github.com/*|github.com/*) ;;
+        *)
+            err "$1 is not a valid GitHub URL"
+            return 1
+            ;;
+    esac
+
+    path=${url#*github.com/}
+    path=${path%%\#*}
+    path=${path%%\?*}
+    while [ "${path%/}" != "$path" ]; do path=${path%/}; done
+    case "$path" in
+        *.git) path=${path%.git} ;;
+    esac
+
+    src_kind=""
+    src_owner=""
+    src_repo=""
+    src_slug=""
+
+    case "$path" in
+        stars/*)
+            rest=${path#stars/}
+            case "$rest" in
+                */*)
+                    src_owner=${rest%%/*}
+                    sub=${rest#*/}
+                    if [ "$sub" = "lists" ] || [ "${sub%%/*}" != "lists" ]; then
+                        err "$1 is not a valid GitHub star list URL (expected https://github.com/stars/USER/lists/SLUG)"
+                        return 1
+                    fi
+                    src_slug=${sub#*/}
+                    src_kind="list"
+                    ;;
+                *)
+                    src_owner=$rest
+                    src_kind="stars"
+                    ;;
+            esac
+            ;;
+        */*)
+            src_owner=${path%%/*}
+            rest=${path#*/}
+            src_repo=${rest%%/*}
+            src_kind="repo"
+            ;;
+        *)
+            err "$1 is not a valid GitHub repository URL (expected https://github.com/OWNER/REPO)"
+            return 1
+            ;;
+    esac
+
+    # Owner, repository and list names end up in directories and in the
+    # GraphQL query below, so only characters GitHub itself allows get through.
+    case "$src_owner" in
+        ""|*[!A-Za-z0-9-]*)
+            err "$1: '$src_owner' is not a valid GitHub user name"
+            return 1
+            ;;
+    esac
+    case "$src_kind" in
+        list)
+            if ! valid_name "$src_slug"; then
+                err "$1: '$src_slug' is not a valid list name"
+                return 1
+            fi
+            ;;
+        repo)
+            if ! valid_name "$src_repo"; then
+                err "$1: '$src_repo' is not a valid repository name"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# diagnose_lists OWNER — explain why a lists query failed.
+diagnose_lists() {
+    if grep -q "Could not resolve to a User" "$work/err" 2>/dev/null; then
+        err "$1: no such GitHub user"
+    else
+        err "$1: could not read the star lists"
+        sed 's/^/    /' "$work/err" >&2
+    fi
+}
+
+# list_repos OWNER SLUG — print "OWNER/REPO" for every repository in a star
+# list. Lists are not part of the REST API, so this uses GraphQL.
+list_repos() {
+    owner=$1
+    slug=$2
+    cursor=""
+
+    while :; do
+        after=""
+        if [ -n "$cursor" ]; then
+            after=", after: \"$cursor\""
+        fi
+        query="query { user(login: \"$owner\") { lists(first: 100) { nodes { slug items(first: 100$after) { pageInfo { hasNextPage endCursor } nodes { ... on Repository { nameWithOwner } } } } } } }"
+
+        if ! out=$(gh api graphql -f query="$query" --jq \
+            '.data.user.lists.nodes[] | select(.slug == "'"$slug"'") | (.items.pageInfo.hasNextPage | tostring), (.items.pageInfo.endCursor // "~"), (.items.nodes[]? | .nameWithOwner)' \
+            2>"$work/err"); then
+            diagnose_lists "$owner"
+            return 1
+        fi
+
+        if [ -z "$out" ]; then
+            err "$owner has no star list called '$slug'"
+            available=$(gh api graphql \
+                -f query="query { user(login: \"$owner\") { lists(first: 100) { nodes { slug } } } }" \
+                --jq '.data.user.lists.nodes[].slug' 2>/dev/null || true)
+            if [ -n "$available" ]; then
+                printf '    available lists: %s\n' "$(printf '%s' "$available" | tr '\n' ' ')" >&2
+            fi
+            return 1
+        fi
+
+        has_next=$(printf '%s\n' "$out" | sed -n '1p')
+        cursor=$(printf '%s\n' "$out" | sed -n '2p')
+        printf '%s\n' "$out" | sed -n '3,$p'
+
+        [ "$has_next" = "true" ] || break
+        [ "$cursor" = "~" ] && break
+    done
+    return 0
+}
+
+# stars_repos OWNER — print "OWNER/REPO" for every repository OWNER starred.
+# Authenticating as OWNER makes private stars visible as well.
+stars_repos() {
+    gh api "users/$1/starred?per_page=100" --paginate --jq '.[].full_name'
+}
+
+# sync_repos LABEL ROOT — import every repository listed in $work/repos.
+sync_repos() {
+    local label=$1
+    local root=$2
+    local count
+    local full
+
+    count=$(grep -c . "$work/repos" || true)
+    printf '    %s: %s repositories\n' "$label" "$count"
+    printf '    folder: %s/<owner>/<repo>/README.md\n' "$root"
+    if [ "$count" -eq 0 ]; then
+        printf '    nothing to do\n'
+        return 0
+    fi
+
+    while read -r full; do
+        [ -n "$full" ] || continue
+        sync_readme "$full" "$root/$full"
+    done <"$work/repos"
+}
+
+# sync_readme FULL DIR — write DIR/README.md for FULL, unless the copy that is
+# already there is identical to the one on GitHub.
+sync_readme() {
+    local full=$1
+    local dir=$2
+    local target="$dir/README.md"
+    local existed=0
+    local etag=""
+    local created=0
+    local status
+    local hdrs
+
+    if [ -f "$target" ]; then
+        existed=1
+        etag=$(blob_sha "$target" 2>/dev/null || true)
+    fi
+
+    hdrs=(-H "Accept: application/vnd.github.raw")
+    if [ -n "$etag" ]; then
+        # The value must be quoted: an unquoted hash makes GitHub answer with
+        # the full body (200) instead of "not modified" (304).
+        hdrs[${#hdrs[@]}]="-H"
+        hdrs[${#hdrs[@]}]="If-None-Match: \"$etag\""
+    fi
+
+    if gh api "repos/$full/readme" "${hdrs[@]}" >"$work/body" 2>"$work/err"; then
+        status=ok
+    else
+        case "$(cat "$work/err")" in
+            *"gh: HTTP 304"*)
+                # "Not modified" only counts as unchanged if we asked
+                # conditionally; anything else is a real failure.
+                if [ -n "$etag" ]; then
+                    status=unchanged
+                else
+                    status=failed
+                fi
+                ;;
+            *"HTTP 404"*) status=missing ;;
+            *"HTTP 401"*|*"HTTP 403"*) status=refused ;;
+            *) status=failed ;;
+        esac
+    fi
+
+    total=$((total + 1))
+
+    case "$status" in
+        unchanged)
+            same=$((same + 1))
+            printf '    unchanged: %s\n' "$target"
+            ;;
+        ok)
+            if [ ! -s "$work/body" ]; then
+                err "$full: the README returned by GitHub is empty — skipped"
+                failed=$((failed + 1))
+                return 1
+            fi
+            if [ -e "$target" ] && [ ! -f "$target" ]; then
+                err "$full: $target exists and is not a regular file — skipped"
+                failed=$((failed + 1))
+                return 1
+            fi
+            if [ ! -d "$dir" ]; then
+                if [ -e "$dir" ]; then
+                    err "$full: '$dir' exists and is not a directory — skipped"
+                    failed=$((failed + 1))
+                    return 1
+                fi
+                if ! mkdir -p "$dir"; then
+                    err "$full: could not create '$dir'"
+                    failed=$((failed + 1))
+                    return 1
+                fi
+                created=1
+            fi
+            if mv "$work/body" "$target"; then
+                if [ "$existed" -eq 1 ]; then
+                    updated=$((updated + 1))
+                    printf '    updated:   %s\n' "$target"
+                else
+                    new=$((new + 1))
+                    printf '    new:       %s\n' "$target"
+                fi
+            else
+                err "$full: could not write $target"
+                [ "$created" -eq 1 ] && rmdir -p "$dir" 2>/dev/null
+                failed=$((failed + 1))
+            fi
+            ;;
+        missing)
+            # 404 means either a missing repository or a missing README.
+            # Ask for the repository itself to tell the two apart.
+            if gh api "repos/$full" --silent >/dev/null 2>&1; then
+                err "$full: this repository has no README — nothing downloaded"
+            else
+                err "$full: repository not found (404), or it is private — run: gh auth login"
+            fi
+            failed=$((failed + 1))
+            ;;
+        refused)
+            err "$full: authentication or permission failure — run: gh auth login"
+            err "$full: check the current account with: gh auth status"
+            failed=$((failed + 1))
+            ;;
+        *)
+            err "$full: GitHub API request failed"
+            sed 's/^/    /' "$work/err" >&2
+            failed=$((failed + 1))
+            ;;
+    esac
+    return 0
+}
+
 # --- argument handling -------------------------------------------------------
 
-if [ $# -eq 0 ]; then
+flat=0
+urls=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -flat|--flat)
+            flat=1
+            ;;
+        -list|--list)
+            # Accepted for convenience: star list URLs are detected by shape.
+            ;;
+        --)
+            shift
+            while [ $# -gt 0 ]; do
+                urls[${#urls[@]}]="$1"
+                shift
+            done
+            break
+            ;;
+        -*)
+            err "unknown option: $1"
+            printf '\n' >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            urls[${#urls[@]}]="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ "${#urls[@]}" -eq 0 ]; then
+    err "no repository or star list URL given"
+    printf '\n' >&2
     usage >&2
     exit 2
 fi
-
-case "${1:-}" in
-    -h|--help)
-        usage
-        exit 0
-        ;;
-esac
 
 # --- dependency check --------------------------------------------------------
 
@@ -54,135 +413,82 @@ Install it, then authenticate:
 
   gh auth login
 
-Then re-run getreadme. (gh is required so that private repositories and
-API errors are handled reliably; no unauthenticated fallback is used.)
+Then re-run getreadme. (gh is required so that private repositories, star
+lists and API errors are handled reliably; no unauthenticated fallback is
+used.)
 EOF
     exit 1
 fi
 
-# --- main loop ---------------------------------------------------------------
+# --- main --------------------------------------------------------------------
 
 total=0
+new=0
+updated=0
+same=0
 failed=0
 
-for url in "$@"; do
+work=$(mktemp -d "${TMPDIR:-/tmp}/getreadme.XXXXXX") || {
+    err "could not create a temporary directory"
+    exit 1
+}
+trap 'rm -rf "$work"' EXIT INT TERM
+
+for url in "${urls[@]}"; do
     printf '==> %s\n' "$url"
-    total=$((total + 1))
 
-    # Normalise SSH-style URLs so the parser below only sees one shape.
-    case "$url" in
-        git@github.com:*) url="https://github.com/${url#git@github.com:}" ;;
-    esac
+    if ! parse_source "$url"; then
+        failed=$((failed + 1))
+        continue
+    fi
 
-    # Validate host.
-    case "$url" in
-        https://github.com/*|http://github.com/*|github.com/*) ;;
-        *)
-            err "$url is not a valid GitHub repository URL"
-            failed=$((failed + 1))
-            continue
+    case "$src_kind" in
+        repo)
+            sync_readme "$src_owner/$src_repo" "./$src_owner/$src_repo"
+            ;;
+        list)
+            if ! list_repos "$src_owner" "$src_slug" >"$work/repos"; then
+                failed=$((failed + 1))
+                continue
+            fi
+            root="./$src_slug"
+            [ "$flat" -eq 1 ] && root="."
+            sync_repos "star list \"$src_slug\"" "$root"
+            ;;
+        stars)
+            login=$(gh api "users/$src_owner" --jq .login 2>"$work/err" || true)
+            if [ -z "$login" ]; then
+                err "$src_owner: no such GitHub user"
+                failed=$((failed + 1))
+                continue
+            fi
+            if ! stars_repos "$login" >"$work/repos" 2>"$work/err"; then
+                err "$login: could not read the starred repositories"
+                sed 's/^/    /' "$work/err" >&2
+                failed=$((failed + 1))
+                continue
+            fi
+            root="./$login-stars"
+            [ "$flat" -eq 1 ] && root="."
+            sync_repos "all stars of $login" "$root"
             ;;
     esac
-
-    path=${url#*github.com/}
-    path=${path%%\#*}
-    path=${path%%\?*}
-    while [ "${path%/}" != "$path" ]; do path=${path%/}; done
-    case "$path" in
-        *.git) path=${path%.git} ;;
-    esac
-
-    owner=${path%%/*}
-    rest=${path#*/}
-    repo=${rest%%/*}
-
-    if [ -z "$owner" ] || [ -z "$repo" ] || [ "$rest" = "$path" ]; then
-        err "$url is not a valid GitHub repository URL (expected https://github.com/OWNER/REPO)"
-        failed=$((failed + 1))
-        continue
-    fi
-
-    full="$owner/$repo"
-    dest="./$repo"
-    target="$dest/README.md"
-
-    # Respect an existing folder: never create anything but README.md.
-    created_dir=0
-    if [ -e "$dest" ] && [ ! -d "$dest" ]; then
-        err "$full: './$repo' exists and is not a directory — skipped"
-        failed=$((failed + 1))
-        continue
-    fi
-    if [ ! -d "$dest" ]; then
-        if ! mkdir "$dest"; then
-            err "$full: could not create './$repo'"
-            failed=$((failed + 1))
-            continue
-        fi
-        created_dir=1
-    fi
-
-    if [ -f "$target" ]; then
-        printf '    note: %s already exists and will be overwritten\n' "$target"
-    fi
-
-    work=$(mktemp -d "${TMPDIR:-/tmp}/getreadme.XXXXXX") || {
-        err "$full: could not create a temporary file"
-        [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
-        failed=$((failed + 1))
-        continue
-    }
-
-    if gh api "repos/$full/readme" \
-        -H "Accept: application/vnd.github.raw" >"$work/body" 2>"$work/err"; then
-        if [ -s "$work/body" ]; then
-            if mv "$work/body" "$target"; then
-                printf '    ok: %s\n' "$target"
-            else
-                err "$full: could not write $target"
-                failed=$((failed + 1))
-            fi
-        else
-            err "$full: the README returned by GitHub is empty — skipped"
-            [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
-            failed=$((failed + 1))
-        fi
-    else
-        # Diagnose using gh's own message, so no extra guesswork is needed.
-        case "$(cat "$work/err")" in
-            *"HTTP 404"*)
-                # 404 means either a missing repository or a missing README.
-                # Ask for the repository itself to tell the two apart.
-                if gh api "repos/$full" --silent >/dev/null 2>&1; then
-                    err "$full: this repository has no README — nothing downloaded"
-                else
-                    err "$full: repository not found (404), or it is private — run: gh auth login"
-                fi
-                ;;
-            *"HTTP 401"*|*"HTTP 403"*)
-                err "$full: authentication or permission failure — run: gh auth login"
-                err "$full: check the current account with: gh auth status"
-                ;;
-            *)
-                err "$full: GitHub API request failed"
-                sed 's/^/    /' "$work/err" >&2
-                ;;
-        esac
-        [ "$created_dir" -eq 1 ] && rmdir "$dest" 2>/dev/null
-        failed=$((failed + 1))
-    fi
-
-    rm -rf "$work"
 done
 
 # --- summary -----------------------------------------------------------------
 
 if [ "$total" -eq 0 ]; then
+    if [ "$failed" -gt 0 ]; then
+        printf '%s: %d source(s) failed\n' "$PROG" "$failed" >&2
+        exit 1
+    fi
     exit 0
 fi
 
+printf '%s: %d repositories — %d new, %d updated, %d unchanged, %d failed\n' \
+    "$PROG" "$total" "$new" "$updated" "$same" "$failed"
+
 if [ "$failed" -gt 0 ]; then
-    printf '%s: %d of %d repositories failed\n' "$PROG" "$failed" "$total" >&2
     exit 1
 fi
 
