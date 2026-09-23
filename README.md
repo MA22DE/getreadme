@@ -115,6 +115,15 @@ Copilot, LFS storage); none of them are touched by this tool.
 
 ## Legacy version
 
-The pre-star-list version (188 lines, single-repository URLs only) is kept in
-`legacy/`. It is also preserved in the repository history — the first commit
-`3cba618` contains that original script.
+The pre-star-list version (188 lines, single-repository URLs only, writing to
+`./REPO/README.md`) is not kept as a file — it lives in the repository
+history, where the first commit `3cba618` holds it byte for byte:
+
+```sh
+# browse it
+gh repo view MA22DE/getreadme --branch 3cba618 --web
+git show 3cba618:getreadme
+
+# restore it next to the current script
+git show 3cba618:getreadme > getreadme.old && chmod +x getreadme.old
+```
