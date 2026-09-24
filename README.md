@@ -3,13 +3,26 @@
 Download only the **README** of GitHub repositories and GitHub **star lists** —
 one folder per repository, without cloning anything.
 
+This exists so an AI agent can pull in the READMEs of many repositories at once
+and work through them locally, deciding which open source projects would
+actually be useful for whatever is being built. Point it at a star list, and the
+agent gets a browsable folder tree of candidate READMEs instead of a wall of
+URLs to fetch one by one.
+
+A typical use: you're building an app, you want the agent to know the relevant
+tools and libraries that already exist, so you sync a star list into the project
+and let the agent catalogue what is worth adopting.
+
 Driven entirely by the [GitHub CLI](https://cli.github.com); no API keys, no
 tokens to manage, and incremental re-runs that skip anything unchanged.
 
 ## Requirements
 
 - [`gh`](https://cli.github.com), authenticated (`gh auth login`). Required for
-  private repositories, star lists and reliable error messages.
+  private repositories, star lists and reliable error messages. Run
+  `gh auth status` to check where you stand; an unauthenticated `gh` cannot read
+  star lists at all, because GitHub exposes them only through GraphQL to the
+  signed-in user.
 - `git` or `shasum` for change detection. Without either, the tool still works,
   it just re-downloads every README instead of skipping unchanged ones.
 
@@ -69,6 +82,11 @@ This uses no state file. GitHub's ETag for a README is the Git blob hash of the
 file, so the hash of the local copy is sent back as `If-None-Match`: GitHub
 answers `304 Not Modified` and nothing is transferred.
 
+Because it authenticates as you, private repositories work the same way as
+public ones. Being incremental is what matters once a list gets long: after the
+first import, a refresh with nothing changed costs no downloads at all, and
+because there is no state file, there is nothing to corrupt or to commit.
+
 ## API cost
 
 Use of the GitHub API is **free** — the limits below are abuse-prevention
@@ -113,11 +131,15 @@ Copilot, LFS storage); none of them are touched by this tool.
   lists endpoint, which is why this script uses both APIs.
 - Tested on macOS with the system bash 3.2 (no bash 4+ features are used).
 
+## License
+
+[MIT](LICENSE).
+
 ## Legacy version
 
 The pre-star-list version (188 lines, single-repository URLs only, writing to
 `./REPO/README.md`) is not kept as a file — it lives in the repository
-history, where the first commit `3cba618` holds it byte for byte:
+history, where the first commit holds it byte for byte:
 
 ```sh
 # browse it
